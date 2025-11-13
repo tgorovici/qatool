@@ -1,228 +1,526 @@
 import io
-import time
-from datetime import datetime, date
-from typing import Optional, List
+import math
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 
-import google.auth
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-import gspread
 
-# -----------------------------
-# Auth helpers
-# -----------------------------
+# ============================================================
+# Geometry helpers
+# ============================================================
 
-def get_credentials() -> Credentials:
-    info = dict(st.secrets["gcp_service_account"])  # type: ignore
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/drive.file",
-    ]
-    return Credentials.from_service_account_info(info, scopes=scopes)
+@dataclass
+class Box:
+    frame: int
+    xtl: float
+    ytl: float
+    xbr: float
+    ybr: float
+    outside: int
+    occluded: int
+    attributes: Dict[str, Optional[str]] = field(default_factory=dict)
 
+    @property
+    def width(self) -> float:
+        return max(0.0, self.xbr - self.xtl)
 
-@st.cache_resource(show_spinner=False)
-def get_gspread_client() -> gspread.Client:
-    creds = get_credentials()
-    return gspread.authorize(creds)
+    @property
+    def height(self) -> float:
+        return max(0.0, self.ybr - self.ytl)
 
+    @property
+    def area(self) -> float:
+        return self.width * self.height
 
-@st.cache_resource(show_spinner=False)
-def get_drive_service():
-    creds = get_credentials()
-    return build("drive", "v3", credentials=creds)
-
-
-def get_workers() -> List[str]:
-    try:
-        workers = list(st.secrets.get("sheets", {}).get("workers", []))  # type: ignore
-        return workers
-    except Exception:
-        return []
+    @property
+    def center(self):
+        return ((self.xtl + self.xbr) / 2.0, (self.ytl + self.ybr) / 2.0)
 
 
-def get_sheet_handles():
-    gc = get_gspread_client()
-    ss_name = st.secrets["sheets"]["spreadsheet_name"]
-    ws_name = st.secrets["sheets"]["worksheet_name"]
-    try:
-        sh = gc.open(ss_name)
-    except gspread.SpreadsheetNotFound:
-        sh = gc.create(ss_name)
-    try:
-        ws = sh.worksheet(ws_name)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=ws_name, rows=1000, cols=30)
-        ws.update("A1:N1", [[
-            "timestamp", "project", "task_id", "job_id", "frame",
-            "frame_url", "worker", "label", "severity", "issue_text",
-            "guideline_ref", "attachment_drive_id", "attachment_view_url", "status"
-        ]])
-    return sh, ws
+@dataclass
+class Track:
+    track_id: int
+    label: str
+    boxes: List[Box]
 
 
-def ensure_url(val: str) -> str:
-    return val.strip()
+def compute_iou(b1: Box, b2: Box) -> float:
+    x_left = max(b1.xtl, b2.xtl)
+    y_top = max(b1.ytl, b2.ytl)
+    x_right = min(b1.xbr, b2.xbr)
+    y_bottom = min(b1.ybr, b2.ybr)
+
+    if x_right <= x_left or y_bottom <= y_top:
+        return 0.0
+
+    inter_area = (x_right - x_left) * (y_bottom - y_top)
+    area1 = b1.area
+    area2 = b2.area
+    if area1 <= 0 or area2 <= 0:
+        return 0.0
+
+    union = area1 + area2 - inter_area
+    if union <= 0:
+        return 0.0
+
+    return inter_area / union
 
 
-def build_cvat_url(task_id: str, job_id: str, frame: str) -> Optional[str]:
-    base = st.secrets.get("cvat", {}).get("base_url", "")
-    if not base or not task_id or not job_id or not frame:
-        return None
-    return f"{base}/tasks/{task_id}/jobs/{job_id}?frame={frame}"
+def clamp01(x: float) -> float:
+    if math.isnan(x):
+        return 0.0
+    return max(0.0, min(1.0, x))
 
 
-def upload_to_drive(file_bytes: bytes, filename: str) -> (Optional[str], Optional[str]):
-    folder_id = st.secrets.get("drive", {}).get("folder_id", "")
-    if not folder_id:
-        return None, None
+# ============================================================
+# Parse CVAT video XML
+# ============================================================
 
-    service = get_drive_service()
-
-    from googleapiclient.http import MediaIoBaseUpload
-    media_body = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=None, resumable=False)
-
-    file_metadata = {"name": filename, "parents": [folder_id]}
-    created = service.files().create(body=file_metadata, media_body=media_body, fields="id, webViewLink").execute()
-    file_id = created.get("id")
-    web_view = created.get("webViewLink")
-
-    try:
-        service.permissions().create(fileId=file_id, body={"role": "reader", "type": "anyone"}).execute()
-    except Exception:
-        pass
-
-    return file_id, web_view
-
-
-def append_row(ws, row: list):
-    ws.append_row(row, value_input_option="USER_ENTERED")
-
-
-st.set_page_config(page_title="QA Toolkit", page_icon="🧰", layout="wide")
-
-st.title("🧰 QA Toolkit — Streamlit Cloud")
-
-with st.sidebar:
-    st.markdown("**Connected Sheet:** ")
-    try:
-        sh, ws = get_sheet_handles()
-        st.success(f"{sh.title} → {ws.title}")
-    except Exception as e:
-        st.error(f"Sheet error: {e}")
-
-    if st.secrets.get("drive", {}).get("folder_id", ""):
-        st.success("Google Drive uploads enabled")
+def parse_cvat_video_xml(file_obj) -> List[Track]:
+    """Parse CVAT video XML (1.1) with <track><box> into Track objects."""
+    if isinstance(file_obj, (bytes, bytearray)):
+        f = io.BytesIO(file_obj)
     else:
-        st.info("Drive uploads disabled (no folder_id)")
+        f = file_obj
 
-    st.markdown("**Tips**\n- Share the Sheet and Drive folder with the service account email.\n- Use Batch tab for CSV paste.")
+    tree = ET.parse(f)
+    root = tree.getroot()
+
+    tracks: List[Track] = []
+
+    for track_el in root.findall("track"):
+        track_id = int(track_el.get("id", -1))
+        label = track_el.get("label", "")
+
+        boxes: List[Box] = []
+        for box_el in track_el.findall("box"):
+            try:
+                frame = int(box_el.get("frame"))
+                xtl = float(box_el.get("xtl"))
+                ytl = float(box_el.get("ytl"))
+                xbr = float(box_el.get("xbr"))
+                ybr = float(box_el.get("ybr"))
+            except (TypeError, ValueError):
+                # skip invalid box
+                continue
+
+            outside = int(box_el.get("outside", "0"))
+            occluded = int(box_el.get("occluded", "0"))
+
+            attrs: Dict[str, Optional[str]] = {}
+            for attr_el in box_el.findall("attribute"):
+                name = attr_el.get("name") or ""
+                value = (attr_el.text or "").strip()
+                if value == "":
+                    value = None
+                attrs[name] = value
+
+            boxes.append(
+                Box(
+                    frame=frame,
+                    xtl=xtl,
+                    ytl=ytl,
+                    xbr=xbr,
+                    ybr=ybr,
+                    outside=outside,
+                    occluded=occluded,
+                    attributes=attrs,
+                )
+            )
+
+        boxes.sort(key=lambda b: b.frame)
+        tracks.append(Track(track_id=track_id, label=label, boxes=boxes))
+
+    return tracks
 
 
-tab1, tab2 = st.tabs(["Quick QA Note", "Batch Feedback"])
+# ============================================================
+# Metrics per track
+# ============================================================
 
-with tab1:
-    st.subheader("Quick QA Note")
+def compute_track_metrics(
+    track: Track,
+    iou_consistency_threshold: float,
+    ignore_outside: bool = True,
+) -> Dict:
+    boxes_all = track.boxes
+    if ignore_outside:
+        boxes_geom = [b for b in boxes_all if b.outside == 0]
+    else:
+        boxes_geom = boxes_all
 
-    with st.form("qa_quick_form"):
-        project = st.text_input("Project (optional)")
-        task_id = st.text_input("Task ID")
-        job_id = st.text_input("Job ID")
-        frame = st.text_input("Frame")
-        frame_url = st.text_input("Frame URL (optional)")
+    num_boxes_total = len(boxes_all)
+    num_boxes_geom = len(boxes_geom)
 
-        worker_list = get_workers()
-        worker = st.selectbox("Worker", worker_list) if worker_list else st.text_input("Worker")
+    # Basic frame range
+    first_frame = boxes_all[0].frame if boxes_all else None
+    last_frame = boxes_all[-1].frame if boxes_all else None
+    num_frames_span = (last_frame - first_frame + 1) if first_frame is not None else 0
 
-        label = st.text_input("Label / Class")
-        severity = st.selectbox("Severity", ["Low", "Med", "High", "Blocker"], index=1)
+    # 1) IoU / box consistency
+    ious = []
+    area_changes = []
+    ar_list = []
+    center_moves = []
+    frame_gaps = 0
 
-        issue_text = st.text_area("Issue (short, literal)")
-        guideline_ref = st.text_input("Guideline reference (optional)")
-        shot = st.file_uploader("Screenshot (PNG/JPG)", type=["png", "jpg", "jpeg"])
+    if num_boxes_geom >= 2:
+        for b1, b2 in zip(boxes_geom[:-1], boxes_geom[1:]):
+            if b1.frame == b2.frame:
+                continue
 
-        submitted = st.form_submit_button("Log QA Item", use_container_width=True)
+            # IoU
+            iou = compute_iou(b1, b2)
+            ious.append(iou)
 
-    if submitted:
-        try:
-            sh, ws = get_sheet_handles()
-            link = ensure_url(frame_url) if frame_url.strip() else (build_cvat_url(task_id, job_id, frame) or "")
-            drive_id, drive_url = None, None
+            # Area change
+            if b1.area > 0:
+                rel_area_change = abs(b2.area - b1.area) / b1.area
+                area_changes.append(rel_area_change)
 
-            if shot is not None:
-                file_bytes = shot.read()
-                filename = f"QA_{int(time.time())}_{shot.name}"
-                drive_id, drive_url = upload_to_drive(file_bytes, filename)
+            # Aspect ratio
+            if b1.height > 0 and b2.height > 0:
+                ar1 = b1.width / b1.height
+                ar2 = b2.width / b2.height
+                ar_list.extend([ar1, ar2])
 
-            row = [
-                datetime.utcnow().isoformat(), project, task_id, job_id, frame, link,
-                worker, label, severity, issue_text, guideline_ref, drive_id or "", drive_url or "", "open"
-            ]
-            append_row(ws, row)
+            # Center movement
+            c1x, c1y = b1.center
+            c2x, c2y = b2.center
+            dist = math.sqrt((c2x - c1x) ** 2 + (c2y - c1y) ** 2)
+            center_moves.append(dist)
 
-            st.success("QA item logged.")
-            if link:
-                st.markdown(f"**Frame:** {link}")
-            if drive_url:
-                st.markdown(f"**Screenshot:** {drive_url}")
-        except Exception as e:
-            st.error(f"Failed to log QA item: {e}")
+            # Frame gaps (continuity)
+            gap = b2.frame - b1.frame
+            if gap > 1:
+                frame_gaps += gap - 1
 
-with tab2:
-    st.subheader("Batch Feedback Generator")
+    # IoU stats
+    if len(ious) > 0:
+        avg_iou = sum(ious) / len(ious)
+        min_iou = min(ious)
+        max_iou = max(ious)
+        consistency_ratio = sum(1 for x in ious if x >= iou_consistency_threshold) / len(ious)
+    else:
+        avg_iou = math.nan
+        min_iou = math.nan
+        max_iou = math.nan
+        consistency_ratio = math.nan
 
-    st.markdown("Paste frame URLs or upload a CSV with `frame_url, task_id, job_id, frame, worker, label, severity, issue_text, guideline_ref`. Missing fields use fallback.")
+    # Size jitter
+    if len(area_changes) > 0:
+        mean_area_jitter = sum(area_changes) / len(area_changes)  # 0..∞
+    else:
+        mean_area_jitter = math.nan
 
-    urls_text = st.text_area("Frame URLs (one per line)", height=150)
-    csv_file = st.file_uploader("CSV upload (optional)", type=["csv"])
+    # Aspect ratio stability
+    if len(ar_list) > 1:
+        ar_series = pd.Series(ar_list)
+        ar_std = float(ar_series.std())
+    else:
+        ar_std = math.nan
 
-    st.divider()
-    st.markdown("**Common fields:**")
-    common_project = st.text_input("Project (optional)")
-    common_worker = st.text_input("Worker (fallback)")
-    common_label = st.text_input("Label (fallback)")
-    common_sev = st.selectbox("Severity (fallback)", ["Low", "Med", "High", "Blocker"], index=1)
-    common_issue = st.text_input("Issue (fallback)")
-    common_guideline = st.text_input("Guideline ref (fallback)")
+    # Continuity: how many missing frames inside the span
+    if num_frames_span > 1:
+        continuity_score = 1.0 - clamp01(frame_gaps / num_frames_span)
+    else:
+        continuity_score = 1.0
 
-    if st.button("Create Rows", use_container_width=True):
-        rows = []
-        if csv_file is not None:
-            df = pd.read_csv(csv_file)
-            for _, r in df.iterrows():
-                rows.append({k: r.get(k, "") for k in ["project", "task_id", "job_id", "frame", "frame_url", "worker", "label", "severity", "issue_text", "guideline_ref"]})
-        for line in urls_text.splitlines():
-            u = line.strip()
-            if u:
-                rows.append({"project": "", "task_id": "", "job_id": "", "frame": "", "frame_url": u, "worker": "", "label": "", "severity": "", "issue_text": "", "guideline_ref": ""})
+    # Attribute changes
+    attr_change_counts: Dict[str, int] = {}
+    total_attr_changes = 0
+    total_attr_events = 0
 
-        if not rows:
-            st.warning("No rows to create.")
-        else:
-            sh, ws = get_sheet_handles()
-            created = 0
-            for r in rows:
-                try:
-                    row = [
-                        datetime.utcnow().isoformat(),
-                        r.get("project") or common_project,
-                        r.get("task_id"),
-                        r.get("job_id"),
-                        r.get("frame"),
-                        ensure_url(r.get("frame_url", "")),
-                        r.get("worker") or common_worker,
-                        r.get("label") or common_label,
-                        r.get("severity") or common_sev,
-                        r.get("issue_text") or common_issue,
-                        r.get("guideline_ref") or common_guideline,
-                        "", "", "open"
-                    ]
-                    append_row(ws, row)
-                    created += 1
-                except Exception as e:
-                    st.error(f"Row failed: {e}")
-            st.success(f"Created {created} rows.")
+    all_attr_names = set()
+    for b in boxes_all:
+        all_attr_names.update(b.attributes.keys())
+
+    for attr_name in sorted(all_attr_names):
+        prev_val = None
+        changes = 0
+        events = 0
+        for b in boxes_all:
+            val = b.attributes.get(attr_name)
+            if val is not None:
+                val = val.strip()
+            if val == "":
+                val = None
+
+            if prev_val is None and val is None:
+                pass
+            elif prev_val is None and val is not None:
+                # first seen
+                if events > 0:
+                    changes += 1
+            elif prev_val != val:
+                changes += 1
+
+            prev_val = val
+            events += 1
+
+        attr_change_counts[attr_name] = changes
+        total_attr_changes += changes
+        total_attr_events += events
+
+    if total_attr_events > 0:
+        attr_change_rate = total_attr_changes / total_attr_events
+    else:
+        attr_change_rate = 0.0
+
+    # --------------------------------------------------------
+    # Turn raw metrics into [0..1] scores
+    # --------------------------------------------------------
+
+    # Box consistency score: just average IoU
+    box_consistency_score = clamp01(avg_iou)
+
+    # Drift (we approximate as "how often iou >= threshold")
+    drift_score = clamp01(consistency_ratio)
+
+    # Size jitter score: high jitter -> lower score
+    # Treat mean_area_jitter = 0.0 as perfect, >= 0.3 as very bad
+    if math.isnan(mean_area_jitter):
+        size_jitter_score = 1.0
+    else:
+        size_jitter_score = 1.0 - clamp01(mean_area_jitter / 0.3)
+
+    # Aspect ratio stability: std = 0 is perfect, >= 0.5 is bad
+    if math.isnan(ar_std):
+        ar_stability_score = 1.0
+    else:
+        ar_stability_score = 1.0 - clamp01(ar_std / 0.5)
+
+    # Attribute stability: higher change rate -> lower score
+    # change_rate 0 good, >= 0.3 bad
+    attr_stability_score = 1.0 - clamp01(attr_change_rate / 0.3)
+
+    # continuity_score already in [0..1]
+
+    # Weighted overall track score
+    overall_track_score = (
+        0.35 * box_consistency_score
+        + 0.20 * drift_score
+        + 0.10 * size_jitter_score
+        + 0.05 * ar_stability_score
+        + 0.10 * attr_stability_score
+        + 0.20 * continuity_score
+    )
+
+    metrics = {
+        "track_id": track.track_id,
+        "label": track.label,
+        "num_boxes": num_boxes_total,
+        "num_boxes_for_iou": num_boxes_geom,
+        "first_frame": first_frame,
+        "last_frame": last_frame,
+        "avg_iou": avg_iou,
+        "min_iou": min_iou,
+        "max_iou": max_iou,
+        "consistency_ratio": consistency_ratio,
+        "mean_area_jitter": mean_area_jitter,
+        "ar_std": ar_std,
+        "frame_gaps": frame_gaps,
+        "num_frames_span": num_frames_span,
+        "continuity_score": continuity_score,
+        "total_attr_changes": total_attr_changes,
+        "attr_change_rate": attr_change_rate,
+        "box_consistency_score": box_consistency_score,
+        "drift_score": drift_score,
+        "size_jitter_score": size_jitter_score,
+        "ar_stability_score": ar_stability_score,
+        "attr_stability_score": attr_stability_score,
+        "overall_track_score": overall_track_score,
+    }
+
+    # include per-attribute change counts as extra columns
+    for attr_name, changes in attr_change_counts.items():
+        col = f"attr_changes::{attr_name}"
+        metrics[col] = changes
+
+    return metrics
+
+
+def compute_all_metrics(
+    tracks: List[Track],
+    iou_consistency_threshold: float,
+    ignore_outside: bool,
+) -> pd.DataFrame:
+    rows = []
+    for t in tracks:
+        rows.append(
+            compute_track_metrics(
+                t,
+                iou_consistency_threshold=iou_consistency_threshold,
+                ignore_outside=ignore_outside,
+            )
+        )
+    df = pd.DataFrame(rows)
+    return df
+
+
+# ============================================================
+# Streamlit UI
+# ============================================================
+
+def main():
+    st.set_page_config(
+        page_title="CVAT Video QA — Geometry & Accuracy Score",
+        layout="wide",
+    )
+    st.title("📊 CVAT Video Annotation QA — Geometry & Accuracy Score")
+
+    st.markdown(
+        """
+Upload a **CVAT for video 1.1 XML** file to get:
+
+- Geometry-based QA metrics per **track**
+- A per-track **0–100 accuracy score**
+- A global **task score**
+- A list of **suspicious tracks** (low consistency, high jitter, or unstable attributes)
+"""
+    )
+
+    st.sidebar.header("⚙️ Settings")
+
+    iou_threshold = st.sidebar.slider(
+        "IoU threshold for consistency (drift check)",
+        0.0,
+        1.0,
+        0.7,
+        0.05,
+    )
+    ignore_outside = st.sidebar.checkbox(
+        "Ignore boxes with outside=1 for geometry checks",
+        value=True,
+    )
+    suspicious_score_cutoff = st.sidebar.slider(
+        "Flag tracks with overall score below",
+        0.0,
+        1.0,
+        0.7,
+        0.05,
+    )
+
+    uploaded_file = st.file_uploader(
+        "Upload CVAT video XML",
+        type=["xml"],
+        help="Use the 'CVAT for video 1.1' export format.",
+    )
+
+    if not uploaded_file:
+        st.info("⬆️ Upload a CVAT video XML file to start.")
+        return
+
+    # Parse
+    try:
+        tracks = parse_cvat_video_xml(uploaded_file)
+    except Exception as e:
+        st.error(f"Failed to parse XML: {e}")
+        return
+
+    if not tracks:
+        st.warning("No <track> elements found in XML.")
+        return
+
+    st.success(f"Parsed {len(tracks)} tracks from XML.")
+
+    # Compute metrics
+    df = compute_all_metrics(
+        tracks,
+        iou_consistency_threshold=iou_threshold,
+        ignore_outside=ignore_outside,
+    )
+
+    # Global scores
+    mean_track_score = float(df["overall_track_score"].mean())
+    median_track_score = float(df["overall_track_score"].median())
+    num_tracks = len(df)
+    total_boxes = int(df["num_boxes"].sum())
+
+    # Main KPIs
+    st.subheader("🔝 Task Summary (Geometry-based Accuracy)")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tracks", num_tracks)
+    c2.metric("Total boxes", total_boxes)
+    c3.metric("Mean track score (0–100)", f"{mean_track_score * 100:.1f}")
+    c4.metric("Median track score (0–100)", f"{median_track_score * 100:.1f}")
+
+    st.caption(
+        "Scores are computed from IoU consistency, size jitter, aspect ratio stability, "
+        "attribute stability, and continuity."
+    )
+
+    # Per-track overview
+    st.subheader("📋 Per-track Scores & Metrics")
+
+    display_cols = [
+        "track_id",
+        "label",
+        "num_boxes",
+        "first_frame",
+        "last_frame",
+        "avg_iou",
+        "consistency_ratio",
+        "mean_area_jitter",
+        "ar_std",
+        "continuity_score",
+        "attr_change_rate",
+        "overall_track_score",
+    ]
+    display_cols = [c for c in display_cols if c in df.columns]
+
+    df_view = df[display_cols].copy()
+
+    # Convert scores to % for nicer view
+    for col in ["avg_iou", "consistency_ratio", "continuity_score", "overall_track_score"]:
+        if col in df_view.columns:
+            df_view[col] = df_view[col].astype(float)
+
+    # Round numeric
+    for col in df_view.columns:
+        if df_view[col].dtype in ["float64", "float32"]:
+            df_view[col] = df_view[col].round(3)
+
+    st.dataframe(df_view, use_container_width=True)
+
+    # Suspicious tracks
+    st.subheader("🚨 Suspicious Tracks")
+    suspicious = df[df["overall_track_score"] < suspicious_score_cutoff].copy()
+
+    if suspicious.empty:
+        st.success(
+            f"No tracks below score threshold of {suspicious_score_cutoff:.2f} "
+            f"({suspicious_score_cutoff * 100:.0f}%)."
+        )
+    else:
+        st.warning(
+            f"{len(suspicious)} tracks flagged below {suspicious_score_cutoff:.2f} "
+            f"({suspicious_score_cutoff * 100:.0f}%)."
+        )
+        sus_view = suspicious[display_cols].copy()
+        for col in sus_view.columns:
+            if sus_view[col].dtype in ["float64", "float32"]:
+                sus_view[col] = sus_view[col].round(3)
+        st.dataframe(sus_view, use_container_width=True)
+
+    # Download CSV
+    st.subheader("⬇️ Export")
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download full metrics as CSV",
+        data=csv_bytes,
+        file_name="cvat_video_geometry_metrics.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("---")
+    st.caption(
+        "Hint: You can run this per-task and join with worker IDs (from CVAT or your logs) "
+        "to build per-annotator QA dashboards."
+    )
+
+
+if
